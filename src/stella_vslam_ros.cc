@@ -241,6 +241,14 @@ bool compute_edge_hessian_info(const std::shared_ptr<stella_vslam::data::keyfram
 void system::publish_pose_graph(const rclcpp::Time& stamp) {
     using stella_vslam::data::keyframe;
 
+    // Throttle: the snapshot rebuild is O(edges) and runs in the tracking callback,
+    // so cap its rate to avoid starving real-time tracking (OKVIS-style).
+    const double now_sec = stamp.seconds();
+    if (last_pose_graph_pub_sec_ >= 0.0
+        && (now_sec - last_pose_graph_pub_sec_) < pose_graph_min_interval_) {
+        return;
+    }
+
     std::vector<std::shared_ptr<keyframe>> raw_kfs;
     slam_->get_map_publisher()->get_keyframes(raw_kfs);
 
@@ -344,6 +352,7 @@ void system::publish_pose_graph(const rclcpp::Time& stamp) {
     }
 
     pose_graph_pub_->publish(msg);
+    last_pose_graph_pub_sec_ = now_sec;
 }
 
 void system::setParams() {
@@ -379,6 +388,9 @@ void system::setParams() {
 
     pose_graph_sigma_px_ = 1.0;
     pose_graph_sigma_px_ = node_->declare_parameter("pose_graph_sigma_px", pose_graph_sigma_px_);
+
+    pose_graph_min_interval_ = 1.0;
+    pose_graph_min_interval_ = node_->declare_parameter("pose_graph_min_interval", pose_graph_min_interval_);
 
     transform_tolerance_ = 0.5;
     transform_tolerance_ = node_->declare_parameter("transform_tolerance", transform_tolerance_);

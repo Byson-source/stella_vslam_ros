@@ -73,8 +73,14 @@ public:
     int pose_graph_min_covisibility_;
     // Reprojection noise [px] used for the Hessian information weight (1/sigma^2).
     double pose_graph_sigma_px_;
+    // Minimum wall/stamp interval [s] between pose-graph publishes. Throttles the
+    // O(edges) snapshot rebuild so it cannot starve the real-time tracking thread
+    // (mirrors OKVIS2-X pose_graph_min_interval=1.0).
+    double pose_graph_min_interval_;
     // Number of keyframes at the last publish, for incremental (grow-only) publishing.
     size_t last_pose_graph_num_kfs_ = 0;
+    // Stamp [s] of the last pose-graph publish (-1 = never), for throttling.
+    double last_pose_graph_pub_sec_ = -1.0;
 
     // Publish pose's timestamp in the future
     double transform_tolerance_;
