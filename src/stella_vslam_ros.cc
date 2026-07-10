@@ -1,7 +1,15 @@
 #include <stella_vslam_ros.h>
 #include <stella_vslam/publish/map_publisher.h>
 #include <stella_vslam/data/keyframe.h>
+#include <stella_vslam/data/landmark.h>
+#include <stella_vslam/data/graph_node.h>
+#include <stella_vslam/camera/base.h>
+#include <stella_vslam/camera/perspective.h>
+#include <stella_vslam/camera/fisheye.h>
 
+#include <algorithm>
+#include <cmath>
+#include <map>
 #include <chrono>
 
 #include <tf2_eigen/tf2_eigen.hpp>
@@ -45,6 +53,10 @@ system::system(const std::shared_ptr<stella_vslam::system>& slam,
                                 -1, 0, 0,
                                 0, -1, 0)
                                    .finished();
+    // Pose-graph publisher on the OKVIS2-X contract topic. QoS matches OKVIS
+    // (KeepLast(2), reliable) so a downstream z-floc PGO / rosbag recorder sees it.
+    pose_graph_pub_ = node_->create_publisher<okvis_pose_graph_msgs::msg::PoseGraph>(
+        pose_graph_topic_, rclcpp::QoS(rclcpp::KeepLast(2)));
 }
 
 void system::publish_pose(const Eigen::Matrix4d& cam_pose_wc, const rclcpp::Time& stamp) {
@@ -118,6 +130,222 @@ void system::publish_keyframes(const rclcpp::Time& stamp) {
     keyframes_2d_pub_->publish(keyframes_2d_msg);
 }
 
+namespace {
+
+// Pinhole intrinsics + image bounds pulled from a stella camera model. Fisheye
+// keyframes store undistorted keypoints, so a pinhole reprojection Jacobian with
+// the model fx/fy is the right first-order information (same convention OV-SLAM /
+// DROID-W use for their actual-Hessian edge strength). Equirectangular has no
+// single focal -> not supported (caller falls back to a covisibility proxy).
+struct pinhole_intrinsics {
+    bool ok = false;
+    double fx = 0, fy = 0, cx = 0, cy = 0;
+    double min_x = 0, max_x = 0, min_y = 0, max_y = 0;
+};
+
+pinhole_intrinsics get_pinhole(const stella_vslam::camera::base* cam) {
+    pinhole_intrinsics k;
+    if (!cam) return k;
+    if (cam->model_type_ == stella_vslam::camera::model_type_t::Perspective) {
+        const auto* c = static_cast<const stella_vslam::camera::perspective*>(cam);
+        k.fx = c->fx_; k.fy = c->fy_; k.cx = c->cx_; k.cy = c->cy_;
+    }
+    else if (cam->model_type_ == stella_vslam::camera::model_type_t::Fisheye) {
+        const auto* c = static_cast<const stella_vslam::camera::fisheye*>(cam);
+        k.fx = c->fx_; k.fy = c->fy_; k.cx = c->cx_; k.cy = c->cy_;
+    }
+    else {
+        return k; // unsupported model
+    }
+    k.min_x = cam->img_bounds_.min_x_; k.max_x = cam->img_bounds_.max_x_;
+    k.min_y = cam->img_bounds_.min_y_; k.max_y = cam->img_bounds_.max_y_;
+    k.ok = true;
+    return k;
+}
+
+inline Eigen::Matrix3d skew(const Eigen::Vector3d& v) {
+    Eigen::Matrix3d S;
+    S << 0, -v.z(), v.y(),
+        v.z(), 0, -v.x(),
+        -v.y(), v.x(), 0;
+    return S;
+}
+
+// Accumulate the 2x6 reprojection Jacobian outer product (w * J^T J) of one
+// world landmark observed by keyframe `kf` into JtJ. se3 tangent order is
+// [translation(0..2), rotation(3..5)] (left-perturbation), matching OV-SLAM /
+// DROID-W. Returns false if the landmark is behind / too far / outside the image.
+bool accumulate_pose_hessian(const std::shared_ptr<stella_vslam::data::keyframe>& kf,
+                             const pinhole_intrinsics& k,
+                             const Eigen::Vector3d& pos_w,
+                             double w,
+                             Eigen::Matrix<double, 6, 6>& JtJ) {
+    const Eigen::Matrix3d R_cw = kf->get_rot_cw();
+    const Eigen::Vector3d t_cw = kf->get_trans_cw();
+    const Eigen::Vector3d pc = R_cw * pos_w + t_cw;
+    const double z = pc.z();
+    if (z < 0.1 || z > 80.0) return false;
+    const double iz = 1.0 / z;
+    const double u = k.fx * pc.x() * iz + k.cx;
+    const double v = k.fy * pc.y() * iz + k.cy;
+    if (u < k.min_x || u > k.max_x || v < k.min_y || v > k.max_y) return false;
+
+    Eigen::Matrix<double, 2, 3> Jp;
+    Jp << k.fx * iz, 0.0, -k.fx * pc.x() * iz * iz,
+        0.0, k.fy * iz, -k.fy * pc.y() * iz * iz;
+    Eigen::Matrix<double, 2, 6> J;
+    J.leftCols<3>() = Jp;                // d(reproj)/d(translation)
+    J.rightCols<3>() = -Jp * skew(pc);   // d(reproj)/d(rotation)
+    JtJ.noalias() += w * J.transpose() * J;
+    return true;
+}
+
+// Actual reprojection information for the relative pose between two keyframes,
+// summed over their shared landmarks (bidirectional average of each frame's
+// Hessian), reduced to scalar trans/rot info = geomean of the diagonal triples.
+// Returns false (caller uses covisibility proxy) when fewer than 8 usable shared
+// landmarks or an unsupported camera model.
+bool compute_edge_hessian_info(const std::shared_ptr<stella_vslam::data::keyframe>& kf_a,
+                               const std::shared_ptr<stella_vslam::data::keyframe>& kf_b,
+                               double sigma_px,
+                               double& info_trans, double& info_rot) {
+    const pinhole_intrinsics ka = get_pinhole(kf_a->camera_);
+    const pinhole_intrinsics kb = get_pinhole(kf_b->camera_);
+    if (!ka.ok || !kb.ok) return false;
+
+    const double w = 1.0 / (sigma_px * sigma_px);
+    Eigen::Matrix<double, 6, 6> JtJ_a = Eigen::Matrix<double, 6, 6>::Zero();
+    Eigen::Matrix<double, 6, 6> JtJ_b = Eigen::Matrix<double, 6, 6>::Zero();
+    int n_used = 0;
+
+    const auto lms_a = kf_a->get_landmarks();
+    for (const auto& lm : lms_a) {
+        if (!lm || lm->will_be_erased()) continue;
+        if (lm->get_index_in_keyframe(kf_b) < 0) continue; // not shared with B
+        const Eigen::Vector3d pos_w = lm->get_pos_in_world();
+        const bool oa = accumulate_pose_hessian(kf_a, ka, pos_w, w, JtJ_a);
+        const bool ob = accumulate_pose_hessian(kf_b, kb, pos_w, w, JtJ_b);
+        if (oa && ob) ++n_used;
+    }
+    if (n_used < 8) return false;
+
+    const Eigen::Matrix<double, 6, 1> diag =
+        (0.5 * (JtJ_a + JtJ_b)).diagonal().cwiseMax(1e-6);
+    info_trans = std::exp(diag.head<3>().array().log().mean());
+    info_rot = std::exp(diag.tail<3>().array().log().mean());
+    return true;
+}
+
+} // namespace
+
+void system::publish_pose_graph(const rclcpp::Time& stamp) {
+    using stella_vslam::data::keyframe;
+
+    std::vector<std::shared_ptr<keyframe>> raw_kfs;
+    slam_->get_map_publisher()->get_keyframes(raw_kfs);
+
+    // Keep only live keyframes, sorted ascending by id (= vertex id).
+    std::vector<std::shared_ptr<keyframe>> kfs;
+    kfs.reserve(raw_kfs.size());
+    for (const auto& kf : raw_kfs) {
+        if (kf && !kf->will_be_erased()) kfs.push_back(kf);
+    }
+    if (kfs.size() < 2) return;
+    // Incremental (growing) publication: only emit when the keyframe set changed
+    // (a new KF was inserted or an old one culled) — mirrors OKVIS2-X per-KF grow.
+    if (kfs.size() == last_pose_graph_num_kfs_) return;
+    last_pose_graph_num_kfs_ = kfs.size();
+    std::sort(kfs.begin(), kfs.end(),
+              [](const std::shared_ptr<keyframe>& a, const std::shared_ptr<keyframe>& b) {
+                  return a->id_ < b->id_;
+              });
+
+    okvis_pose_graph_msgs::msg::PoseGraph msg;
+    msg.header.stamp = stamp;
+    msg.header.frame_id = map_frame_;
+
+    auto to_pose = [](const Eigen::Matrix4d& T) {
+        geometry_msgs::msg::Pose p;
+        const Eigen::Vector3d r = T.block<3, 1>(0, 3);
+        const Eigen::Quaterniond q(Eigen::Matrix3d(T.block<3, 3>(0, 0)));
+        p.position.x = r.x(); p.position.y = r.y(); p.position.z = r.z();
+        p.orientation.x = q.x(); p.orientation.y = q.y();
+        p.orientation.z = q.z(); p.orientation.w = q.w();
+        return p;
+    };
+
+    // --- Vertices: T_WS = camera->world (native stella / CV frame, up-to-scale
+    //     for monocular). Self-consistent with edge_rel below. ---
+    std::map<unsigned int, std::shared_ptr<keyframe>> kf_by_id;
+    for (const auto& kf : kfs) {
+        kf_by_id.emplace(kf->id_, kf);
+        msg.vertex_id.push_back(static_cast<uint64_t>(kf->id_));
+        msg.vertex_stamp_ns.push_back(static_cast<int64_t>(kf->timestamp_ * 1e9));
+        msg.vertex_pose.push_back(to_pose(kf->get_pose_wc()));
+    }
+
+    // --- Edges. Dedup on (i<j); prefer VO(type0) for consecutive KFs, else
+    //     covis/loop(type1). Strength = actual reprojection Hessian info. ---
+    struct edge_info { uint8_t type; int covis; };
+    std::map<std::pair<unsigned int, unsigned int>, edge_info> edges;
+
+    // Sequential VO edges (type 0) between consecutive keyframes by id.
+    for (size_t i = 1; i < kfs.size(); ++i) {
+        const unsigned int a = kfs[i - 1]->id_, b = kfs[i]->id_;
+        const int cov = static_cast<int>(kfs[i]->graph_node_->get_num_shared_landmarks(kfs[i - 1]));
+        edges[{a, b}] = edge_info{0, cov};
+    }
+    // Covisibility + loop edges (type 1).
+    for (const auto& kf : kfs) {
+        const auto loop_edges = kf->graph_node_->get_loop_edges();
+        const auto covis = kf->graph_node_->get_covisibilities();
+        for (const auto& nb : covis) {
+            if (!nb || nb->will_be_erased()) continue;
+            if (!kf_by_id.count(nb->id_)) continue;
+            const int cov = static_cast<int>(kf->graph_node_->get_num_shared_landmarks(nb));
+            const bool is_loop = loop_edges.count(nb) > 0;
+            if (!is_loop && cov < pose_graph_min_covisibility_) continue;
+            const unsigned int a = std::min(kf->id_, nb->id_);
+            const unsigned int b = std::max(kf->id_, nb->id_);
+            if (a == b) continue;
+            auto it = edges.find({a, b});
+            if (it == edges.end()) {
+                edges[{a, b}] = edge_info{1, cov};
+            }
+            else if (it->second.type == 0) {
+                // keep VO type but remember covisibility count / loop flag
+                it->second.covis = std::max(it->second.covis, cov);
+                if (is_loop) it->second.type = 1;
+            }
+        }
+    }
+
+    for (const auto& kv : edges) {
+        const unsigned int ia = kv.first.first, ib = kv.first.second;
+        const auto& kf_a = kf_by_id.at(ia);
+        const auto& kf_b = kf_by_id.at(ib);
+        // edge_rel = T_AB = T_WA^-1 * T_WB = pose_cw(A) * pose_wc(B)
+        const Eigen::Matrix4d T_AB = kf_a->get_pose_cw() * kf_b->get_pose_wc();
+
+        double info_trans = 0.0, info_rot = 0.0;
+        if (!compute_edge_hessian_info(kf_a, kf_b, pose_graph_sigma_px_, info_trans, info_rot)) {
+            // Fallback: covisibility proxy (still per-edge, never a constant).
+            const double proxy = 500.0 * std::max(1, kv.second.covis);
+            info_trans = proxy;
+            info_rot = proxy;
+        }
+
+        msg.edge_i.push_back(static_cast<uint64_t>(ia));
+        msg.edge_j.push_back(static_cast<uint64_t>(ib));
+        msg.edge_rel.push_back(to_pose(T_AB));
+        msg.edge_info_trans.push_back(info_trans);
+        msg.edge_info_rot.push_back(info_rot);
+        msg.edge_type.push_back(kv.second.type);
+    }
+
+    pose_graph_pub_->publish(msg);
+}
+
 void system::setParams() {
     odom_frame_ = std::string("odom");
     odom_frame_ = node_->declare_parameter("odom_frame", odom_frame_);
@@ -139,6 +367,18 @@ void system::setParams() {
 
     publish_keyframes_ = true;
     publish_keyframes_ = node_->declare_parameter("publish_keyframes", publish_keyframes_);
+
+    publish_pose_graph_ = true;
+    publish_pose_graph_ = node_->declare_parameter("publish_pose_graph", publish_pose_graph_);
+
+    pose_graph_topic_ = std::string("/okvis/okvis_pose_graph");
+    pose_graph_topic_ = node_->declare_parameter("pose_graph_topic", pose_graph_topic_);
+
+    pose_graph_min_covisibility_ = 15;
+    pose_graph_min_covisibility_ = node_->declare_parameter("pose_graph_min_covisibility", pose_graph_min_covisibility_);
+
+    pose_graph_sigma_px_ = 1.0;
+    pose_graph_sigma_px_ = node_->declare_parameter("pose_graph_sigma_px", pose_graph_sigma_px_);
 
     transform_tolerance_ = 0.5;
     transform_tolerance_ = node_->declare_parameter("transform_tolerance", transform_tolerance_);
@@ -244,6 +484,9 @@ void mono::callback(sensor_msgs::msg::Image::UniquePtr msg_unique_ptr) {
     if (publish_keyframes_) {
         publish_keyframes(msg->header.stamp);
     }
+    if (publish_pose_graph_) {
+        publish_pose_graph(msg->header.stamp);
+    }
 }
 
 void mono::callback(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
@@ -267,6 +510,9 @@ void mono::callback(const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
     }
     if (publish_keyframes_) {
         publish_keyframes(msg->header.stamp);
+    }
+    if (publish_pose_graph_) {
+        publish_pose_graph(msg->header.stamp);
     }
 }
 
@@ -322,6 +568,9 @@ void stereo::callback(const sensor_msgs::msg::Image::ConstSharedPtr& left, const
     if (publish_keyframes_) {
         publish_keyframes(left->header.stamp);
     }
+    if (publish_pose_graph_) {
+        publish_pose_graph(left->header.stamp);
+    }
 }
 
 rgbd::rgbd(const std::shared_ptr<stella_vslam::system>& slam,
@@ -372,6 +621,9 @@ void rgbd::callback(const sensor_msgs::msg::Image::ConstSharedPtr& color, const 
     }
     if (publish_keyframes_) {
         publish_keyframes(color->header.stamp);
+    }
+    if (publish_pose_graph_) {
+        publish_pose_graph(color->header.stamp);
     }
 }
 

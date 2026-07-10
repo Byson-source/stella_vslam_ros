@@ -23,6 +23,7 @@
 #include <opencv2/core/core.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <okvis_pose_graph_msgs/msg/pose_graph.hpp>
 
 namespace stella_vslam_ros {
 class system {
@@ -32,6 +33,10 @@ public:
            const std::string& mask_img_path);
     void publish_pose(const Eigen::Matrix4d& cam_pose_wc, const rclcpp::Time& stamp);
     void publish_keyframes(const rclcpp::Time& stamp);
+    // Publish the incremental (growing) pose graph as okvis_pose_graph_msgs/PoseGraph
+    // on the OKVIS2-X contract topic. Edge strength is the actual reprojection
+    // information (Hessian J^T J over shared landmarks), not a constant.
+    void publish_pose_graph(const rclcpp::Time& stamp);
     void setParams();
     std::shared_ptr<stella_vslam::system> slam_;
     std::shared_ptr<stella_vslam::config> cfg_;
@@ -42,6 +47,7 @@ public:
     std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> pose_pub_;
     std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseArray>> keyframes_pub_;
     std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseArray>> keyframes_2d_pub_;
+    std::shared_ptr<rclcpp::Publisher<okvis_pose_graph_msgs::msg::PoseGraph>> pose_graph_pub_;
     std::shared_ptr<rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>>
         init_pose_sub_;
     std::shared_ptr<tf2_ros::TransformBroadcaster> map_to_odom_broadcaster_;
@@ -58,6 +64,17 @@ public:
 
     // If true, publish keyframes
     bool publish_keyframes_;
+
+    // --- Pose-graph publication (okvis_pose_graph_msgs/PoseGraph) ---
+    // If true, publish the growing pose graph each time a new keyframe appears.
+    bool publish_pose_graph_;
+    std::string pose_graph_topic_;
+    // Minimum shared-landmark count for a covisibility edge to be emitted.
+    int pose_graph_min_covisibility_;
+    // Reprojection noise [px] used for the Hessian information weight (1/sigma^2).
+    double pose_graph_sigma_px_;
+    // Number of keyframes at the last publish, for incremental (grow-only) publishing.
+    size_t last_pose_graph_num_kfs_ = 0;
 
     // Publish pose's timestamp in the future
     double transform_tolerance_;
